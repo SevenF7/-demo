@@ -22,7 +22,6 @@ def load_model(model_type='vgg', model_path=None, num_classes=8):
     elif model_type == 'resnet':
         model = models.resnet50(pretrained=False)
         num_features = model.fc.in_features
-        # 使用与训练时相同的分类器结构
         model.fc = nn.Sequential(
             nn.Linear(num_features, 512),
             nn.ReLU(),
@@ -31,7 +30,6 @@ def load_model(model_type='vgg', model_path=None, num_classes=8):
         )
     elif model_type == 'mobilenet':
         model = models.mobilenet_v2(pretrained=False)
-        # 修改分类器结构，与训练时保持一致
         model.classifier = nn.Sequential(
             nn.Dropout(p=0.2),
             nn.Linear(1280, 512),
@@ -44,7 +42,6 @@ def load_model(model_type='vgg', model_path=None, num_classes=8):
     
     if model_path:
         checkpoint = torch.load(model_path, map_location=device)
-        # 直接加载state_dict，不需要修改键名
         model.load_state_dict(checkpoint['model_state_dict'])
     
     model = model.to(device)
@@ -53,7 +50,7 @@ def load_model(model_type='vgg', model_path=None, num_classes=8):
 
 def boundary_attack(model, orig_image, target_image, num_steps=10000, step_size=0.01, spherical_step=0.01, device='cpu', progress_callback=None):
     """
-    Boundary Attack 实现。
+    Boundary Attack 实现
     :param model: 目标分类模型
     :param orig_image: 原始图像 (未被误分类的样本)
     :param target_image: 目标图像 (被误分类的样本)
@@ -159,15 +156,15 @@ def main():
     model = load_model(model_type=model_type, model_path=model_path)
     
     # 加载示例图像
-    orig_image = preprocess_image("data/processed_data/train/Car/000003_614_181_727_284.png")
-    target_image = preprocess_image("data/processed_data/train/Truck/000019_0_0_424_374.png")
+    orig_image = preprocess_image("data/汽车1.jpg")
+    target_image = preprocess_image("data/卡车2.jpg")
     
     # 生成对抗样本
     adversarial = boundary_attack(model, orig_image, target_image, num_steps=1000, device=device)
     
     # 保存对抗样本
     adv_img = postprocess_image(adversarial)
-    adv_img.save(f"adversarial_{model_type}.png")
+    adv_img.save(f"BAadversarial_{model_type}.png")
     
     # 打印预测结果
     with torch.no_grad():

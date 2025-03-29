@@ -1,113 +1,61 @@
-import os
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
-import torch
-import torch.nn as nn
-import torchvision.models as models
-from art.estimators.classification import PyTorchClassifier
-from art.attacks.evasion import FastGradientMethod
 import numpy as np
+import torch
+import torchvision.models as models
+from PIL import Image
+import requests
+from io import BytesIO
+import matplotlib.pyplot as plt
+import foolbox as fb
 
-# 自定义数据集，读取图像与对应标签（这里取标签文件的第一个单词作为类别）
-class KITTIDataset(Dataset):
-    def __init__(self, image_dir, label_dir, transform=None):
-        """
-        image_dir: 图像文件夹路径
-        label_dir: 标签文件夹路径
-        transform: 图像预处理变换
-        """
-        self.image_dir = image_dir
-        self.label_dir = label_dir
-        self.transform = transform
-        # 假设图像都是 .png 文件，按照文件名排序
-        self.image_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
-        # 建立类别映射表
-        self.label2idx = {"Car": 0, "Van": 1, "Truck": 2, "Pedestrian": 3, 
-                           "Person_sitting": 4, "Cyclist": 5, "Tram": 6, "Misc": 7, "DontCare": 8}
+# 加载预训练模型（以ResNet-18为例）
+model = models.resnet18(pretrained=True).eval()
+preprocessing = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], axis=-3)
+fmodel = fb.PyTorchModel(model, bounds=(0, 1), preprocessing=preprocessing)
 
-    def __len__(self):
-        return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        image_name = self.image_files[idx]
-        image_path = os.path.join(self.image_dir, image_name)
-        label_path = os.path.join(self.label_dir, image_name.replace('.png', '.txt'))
-        
-        # 打开图像，并转换为RGB格式
-        image = Image.open(image_path).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        
-        # 读取标签文件，取第一列作为类别
-        with open(label_path, 'r') as f:
-            content = f.readline().strip().split()
-        obj_type = content[0]
-        label = self.label2idx.get(obj_type, -1)
-        
-        return image, label
+# 加载输入图像（示例：从URL加载）
+url = "https://example.com/cat.jpg"  # 替换为实际图片URL
+response = requests.get(url)
+image = Image.open(BytesIO(response.content)).convert("RGB")
+image = image.resize((224, 224))  # ResNet输入尺寸为224x224
+image = np.array(image).astype(np.float32) / 255.0  # 归一化到[0,1]
 
-# 定义数据预处理
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-# 数据目录路径（WSL 中的 Linux 路径）
-image_dir = "data/data_object_image_2/training/image_2"
-label_dir = "data/training/label_2"
-
-# 创建数据集和 DataLoader
-dataset = KITTIDataset(image_dir, label_dir, transform=transform)
-# dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
-dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
-
-# 加载预训练的 ResNet50 模型，并修改最后一层（这里假设输出9个类别）
-model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, 9)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-model.eval()  # 使用预训练模型，不进行训练
-
-# 使用 ART 库将模型封装为分类器
-classifier = PyTorchClassifier(
-    model=model,
-    loss=nn.CrossEntropyLoss(),
-    optimizer=None,  # 不需要优化器，因为不训练
-    input_shape=(3, 224, 224),
-    nb_classes=9,
-    clip_values=(0, 1)
-)
-
-# 定义 FGSM 攻击
-attack_fgsm = FastGradientMethod(estimator=classifier, eps=0.03)
-
-# 从 DataLoader 中获取一批样本
-# images, labels = next(iter(dataloader))
-# images = images.to(device)
-
-image, label = dataset[2]
-image = image.unsqueeze(0)
-
-# 先预测原始样本的输出
+# 检查模型原始预测
+image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
 with torch.no_grad():
-    # outputs_orig = model(images)
-    outputs_orig = model(image)
-preds_orig = torch.argmax(outputs_orig, dim=1).detach().cpu().numpy()
+    logits = model(image_tensor)
+original_label = logits.argmax().item()
+print(f"Original label: {original_label}")
 
-# 将原始样本转换为 numpy 数组供 ART 使用
-# images_np = images.detach().cpu().numpy()
-images_np = image.detach().cpu().numpy()
+# 初始化Boundary Attack
+attack = fb.attacks.BoundaryAttack(steps=1000)  # 设置迭代次数
 
 # 生成对抗样本
-adv_images = attack_fgsm.generate(x=images_np)
+raw, clipped, is_adv = attack(fmodel, image, original_label, epsilons=None)
 
-# 对对抗样本进行预测
-preds_adv = classifier.predict(adv_images)
-preds_adv_idx = np.argmax(preds_adv, axis=1)
-
-print("Original predictions:", preds_orig)
-print("Adversarial predictions:", preds_adv_idx)
+# 检查对抗样本是否成功
+if is_adv:
+    adversarial_label = fmodel(clipped).argmax()
+    print(f"Adversarial label: {adversarial_label}")
+    
+    # 可视化结果
+    plt.figure(figsize=(10, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.title("Original Image")
+    plt.imshow(image)
+    plt.axis("off")
+    
+    plt.subplot(1, 3, 2)
+    plt.title("Adversarial Image")
+    plt.imshow(clipped)
+    plt.axis("off")
+    
+    plt.subplot(1, 3, 3)
+    plt.title("Perturbation")
+    perturbation = np.clip(10 * (clipped - image), 0, 1)
+    plt.imshow(perturbation)
+    plt.axis("off")
+    
+    plt.show()
+else:
+    print("Attack failed!")

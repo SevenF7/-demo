@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib
 from boundary_attack import boundary_attack, preprocess_image, postprocess_image
+import torch.nn.functional as F
 
 # 设置matplotlib中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
@@ -219,8 +220,50 @@ class PredictorGUI:
         tk.Label(attack_frame, text="攻击方法:").pack(side=tk.LEFT)
         self.attack_var = tk.StringVar(value="Boundary Attack")
         self.attack_combo = ttk.Combobox(attack_frame, textvariable=self.attack_var, state='readonly')
-        self.attack_combo['values'] = ['Boundary Attack']
+        self.attack_combo['values'] = ['Boundary Attack', 'SimBA']
         self.attack_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 目标类别选择
+        target_frame = tk.Frame(scrollable_frame)
+        target_frame.pack(pady=10)
+        
+        tk.Label(target_frame, text="目标类别:").pack(side=tk.LEFT)
+        self.target_var = tk.StringVar()
+        self.target_combo = ttk.Combobox(target_frame, textvariable=self.target_var, state='readonly')
+        self.target_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 攻击参数框架
+        params_frame = tk.Frame(scrollable_frame)
+        params_frame.pack(pady=10, fill=tk.X)
+        
+        # SimBa 参数
+        self.simba_frame = tk.LabelFrame(params_frame, text="SimBa 参数")
+        self.simba_frame.pack(pady=5, fill=tk.X, padx=5)
+        
+        # 迭代次数
+        iters_frame = tk.Frame(self.simba_frame)
+        iters_frame.pack(pady=5, fill=tk.X)
+        tk.Label(iters_frame, text="迭代次数:").pack(side=tk.LEFT, padx=5)
+        self.iters_var = tk.IntVar(value=1000)
+        iters_options = [1000, 2000, 3000, 5000, 10000]
+        self.iters_combo = ttk.Combobox(iters_frame, textvariable=self.iters_var, state='readonly', values=iters_options, width=10)
+        self.iters_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Epsilon 参数（最大扰动）
+        epsilon_frame = tk.Frame(self.simba_frame)
+        epsilon_frame.pack(pady=5, fill=tk.X)
+        tk.Label(epsilon_frame, text="最大扰动 (Epsilon):").pack(side=tk.LEFT, padx=5)
+        self.epsilon_var = tk.DoubleVar(value=0.2)
+        epsilon_options = [0.1, 0.2, 0.3, 0.4, 0.5]
+        self.epsilon_combo = ttk.Combobox(epsilon_frame, textvariable=self.epsilon_var, state='readonly', values=epsilon_options, width=10)
+        self.epsilon_combo.pack(side=tk.LEFT, padx=5)
+        
+        # 是否进行目标攻击
+        targeted_frame = tk.Frame(self.simba_frame)
+        targeted_frame.pack(pady=5, fill=tk.X)
+        self.targeted_var = tk.BooleanVar(value=False)
+        self.targeted_check = ttk.Checkbutton(targeted_frame, text="目标攻击", variable=self.targeted_var)
+        self.targeted_check.pack(side=tk.LEFT, padx=5)
         
         # 源图片选择
         self.source_button = tk.Button(
@@ -235,7 +278,7 @@ class PredictorGUI:
         self.source_label = tk.Label(scrollable_frame, text="未选择源图片", wraplength=400)
         self.source_label.pack(pady=5)
         
-        # 目标图片选择
+        # 目标图片选择（仅用于Boundary Attack）
         self.target_button = tk.Button(
             scrollable_frame,
             text="选择目标图片",
@@ -280,14 +323,31 @@ class PredictorGUI:
         self.adv_image_label = tk.Label(scrollable_frame)
         self.adv_image_label.pack(pady=10)
         
-        # 显示对抗样本生成结果
-        self.adv_result_text = tk.Text(scrollable_frame, height=10, width=50)
+        # 显示对抗样本生成结果和进度信息
+        self.adv_result_text = tk.Text(scrollable_frame, height=15, width=50)
         self.adv_result_text.pack(pady=20)
         
         # 配置滚动区域
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
+        # 绑定攻击方法选择事件
+        self.attack_combo.bind('<<ComboboxSelected>>', self.on_attack_method_change)
+        
+    def on_attack_method_change(self, event=None):
+        """当攻击方法改变时更新界面"""
+        attack_method = self.attack_var.get()
+        if attack_method == "Boundary Attack":
+            self.target_button.config(state='normal')
+            self.target_label.config(state='normal')
+            self.target_combo.config(state='disabled')
+            self.simba_frame.pack_forget()  # 隐藏SimBa参数
+        else:
+            self.target_button.config(state='disabled')
+            self.target_label.config(state='disabled')
+            self.target_combo.config(state='readonly')
+            self.simba_frame.pack(pady=5, fill=tk.X, padx=5)  # 显示SimBa参数
+            
     def select_adversarial_image(self, image_type):
         """选择对抗样本生成用的图片"""
         if self.predictor is None:
@@ -311,6 +371,12 @@ class PredictorGUI:
         self.progress_label.config(text=f"生成进度: {progress:.1f}%")
         self.window.update()
         
+    def update_status(self, text):
+        """更新状态文本"""
+        self.adv_result_text.insert(tk.END, text + "\n")
+        self.adv_result_text.see(tk.END)  # 自动滚动到底部
+        self.window.update()
+        
     def generate_adversarial(self):
         """生成对抗样本"""
         if self.predictor is None:
@@ -318,35 +384,98 @@ class PredictorGUI:
             return
             
         source_path = self.source_label.cget("text")
-        target_path = self.target_label.cget("text")
-        
-        if source_path == "未选择源图片" or target_path == "未选择目标图片":
-            messagebox.showerror("错误", "请先选择源图片和目标图片！")
+        if source_path == "未选择源图片":
+            messagebox.showerror("错误", "请先选择源图片！")
             return
             
         try:
             # 禁用生成按钮
             self.generate_button.config(state='disabled')
             
-            # 重置进度条
+            # 重置进度条和结果文本
             self.progress_var.set(0)
             self.progress_label.config(text="准备生成对抗样本...")
+            self.adv_result_text.delete(1.0, tk.END)
             self.window.update()
             
             # 加载和预处理图片
             orig_image = preprocess_image(source_path)
-            target_image = preprocess_image(target_path)
             
-            # 生成对抗样本
-            num_steps = 1000
-            adversarial = boundary_attack(
-                self.predictor.model,
-                orig_image,
-                target_image,
-                num_steps=num_steps,
-                device=self.predictor.device,
-                progress_callback=self.update_progress
-            )
+            # 根据选择的攻击方法生成对抗样本
+            attack_method = self.attack_var.get()
+            if attack_method == "Boundary Attack":
+                target_path = self.target_label.cget("text")
+                if target_path == "未选择目标图片":
+                    messagebox.showerror("错误", "请先选择目标图片！")
+                    return
+                    
+                target_image = preprocess_image(target_path)
+                # 确保图像在正确的设备上
+                orig_image = orig_image.to(self.predictor.device)
+                target_image = target_image.to(self.predictor.device)
+                
+                self.update_status("执行Boundary Attack...")
+                adversarial = boundary_attack(
+                    self.predictor.model,
+                    orig_image,
+                    target_image,
+                    num_steps=1000,
+                    device=self.predictor.device,
+                    progress_callback=self.update_progress
+                )
+            else:  # SimBa
+                # 获取原始图片的预测类别
+                with torch.no_grad():
+                    orig_output = self.predictor.model(orig_image.unsqueeze(0).to(self.predictor.device))
+                    orig_pred = orig_output.argmax(dim=1).item()
+                
+                # 如果是目标攻击，检查是否选择了目标类别
+                if self.targeted_var.get():
+                    target_class = self.target_combo.current()
+                    if target_class < 0:
+                        messagebox.showerror("错误", "请选择目标类别！")
+                        return
+                else:
+                    target_class = orig_pred  # 使用原始类别
+                    
+                # 获取参数
+                epsilon = self.epsilon_var.get()
+                num_iters = self.iters_var.get()
+                targeted = self.targeted_var.get()
+                
+                self.update_status(f"执行SimBa...\n参数: epsilon={epsilon}, 迭代次数={num_iters}, 目标攻击={targeted}")
+                
+                # 创建SimBA攻击器
+                from kitti_simba_attack import KittiSimBA
+                attacker = KittiSimBA(self.predictor.model)
+                
+                # 定义进度回调函数
+                def update_progress(step, message):
+                    # 更新进度条（使用平滑过渡）
+                    progress = (step / num_iters) * 100
+                    current_progress = self.progress_var.get()
+                    if progress > current_progress:
+                        # 使用线性插值进行平滑过渡
+                        steps = 10
+                        for i in range(steps):
+                            smooth_progress = current_progress + (progress - current_progress) * (i + 1) / steps
+                            self.progress_var.set(smooth_progress)
+                            self.progress_label.config(text=f"生成进度: {smooth_progress:.1f}%")
+                            self.window.update()
+                            self.window.after(10)  # 添加小延迟使动画更流畅
+                    
+                    # 更新结果文本
+                    self.update_status(message)
+                
+                # 执行攻击
+                adversarial = attacker.simba_single(
+                    orig_image.squeeze(0),
+                    torch.tensor([target_class], device=self.predictor.device),
+                    num_iters=num_iters,
+                    epsilon=epsilon,
+                    targeted=targeted,
+                    progress_callback=update_progress
+                )
             
             # 保存对抗样本
             adv_img = postprocess_image(adversarial)
@@ -360,8 +489,24 @@ class PredictorGUI:
                 orig_pred = self.predictor.model(orig_image.unsqueeze(0).to(self.predictor.device)).argmax(dim=1).item()
                 adv_pred = self.predictor.model(adversarial.unsqueeze(0).to(self.predictor.device)).argmax(dim=1).item()
                 
-            result_text = f"源图片预测类别: {self.predictor.classes[orig_pred]}\n"
-            result_text += f"对抗样本预测类别: {self.predictor.classes[adv_pred]}\n"
+                # 计算置信度
+                orig_probs = F.softmax(self.predictor.model(orig_image.unsqueeze(0).to(self.predictor.device)), dim=1)
+                adv_probs = F.softmax(self.predictor.model(adversarial.unsqueeze(0).to(self.predictor.device)), dim=1)
+                
+                # 计算扰动大小
+                perturbation = torch.norm((adversarial - orig_image).view(-1), p=2).item()
+                
+            result_text = f"源图片预测类别: {self.predictor.classes[orig_pred]} (置信度: {orig_probs[0, orig_pred]:.4f})\n"
+            result_text += f"对抗样本预测类别: {self.predictor.classes[adv_pred]} (置信度: {adv_probs[0, adv_pred]:.4f})\n"
+            
+            if attack_method == "SimBa":
+                result_text += f"目标类别置信度: {adv_probs[0, target_class]:.4f}\n"
+                result_text += f"扰动大小(L2范数): {perturbation:.6f}\n"
+                
+                if adv_pred == target_class:
+                    result_text += "\n攻击成功! 对抗样本被成功分类为目标类别。"
+                else:
+                    result_text += "\n攻击未成功。可以尝试增加epsilon或迭代次数。"
             
             self.adv_result_text.delete(1.0, tk.END)
             self.adv_result_text.insert(tk.END, result_text)
@@ -369,9 +514,11 @@ class PredictorGUI:
             # 更新进度条为完成状态
             self.progress_var.set(100)
             self.progress_label.config(text="生成完成！")
+            self.update_status("对抗样本生成完成")
             
         except Exception as e:
             messagebox.showerror("错误", f"生成对抗样本时出错：{str(e)}")
+            self.update_status(f"错误: {str(e)}")
         finally:
             # 重新启用生成按钮
             self.generate_button.config(state='normal')
@@ -407,6 +554,8 @@ class PredictorGUI:
         try:
             if os.path.exists(model_path):
                 self.predictor = KITTIPredictor(model_path)
+                # 更新目标类别下拉框
+                self.target_combo['values'] = self.predictor.classes
                 messagebox.showinfo("成功", f"已加载{model_name}模型")
             else:
                 messagebox.showerror("错误", f"未找到模型文件: {model_path}")
